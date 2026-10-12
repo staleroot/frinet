@@ -1,0 +1,7 @@
+# python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# tracer output (per-thread .frinet traces land here)
+tracer/traces/

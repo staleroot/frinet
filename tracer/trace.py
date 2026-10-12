@@ -1,6 +1,5 @@
 #!/bin/env python3
 
-import re
 import argparse
 import logging
 import os
@@ -9,6 +8,13 @@ import time
 import pathlib
 import frida
 from slow.trace_slow import do_slowmode_output
+from frinet import (
+    FrinetTraceWriter,
+    build_spawn_kwargs,
+    is_android_system_parameters,
+    trace_filename,
+    wait_for_quiet,
+)
 
 wd = os.path.dirname(os.path.abspath(__file__))
 MODULE_JS_PATH = os.path.join(wd,'trace.js')
@@ -70,6 +76,12 @@ def do_trace(args, attach):
     else:
         logging.info('Using local device')
         dev = devmgr.get_local_device()
+
+    # FRINET conversion state (created once the device is known); the tail of
+    # every thread file is flushed on every exit path.
+    writer = None
+    flush_writer = lambda: None
+
     try:
         sysenv = dev.query_system_parameters()
         logging.debug(f'sysenv: {sysenv}')
@@ -77,6 +89,11 @@ def do_trace(args, attach):
 
         process = args.process
         procname = process
+
+        # The target platform decides how the process is spawned; it is taken
+        # from the *device* parameters, never from the host OS.
+        is_android = is_android_system_parameters(sysenv)
+        logging.info(f'Target is {"Android" if is_android else sysenv["platform"]}.')
 
         if attach :
             if process.isnumeric():
@@ -97,19 +114,34 @@ def do_trace(args, attach):
             if args.args:
                 argv = args.args.split(",")
             procname = process.split("/")[-1]
-            process = int(dev.spawn(process, argv=argv, env={}, cwd=None, stdio="pipe"))
+            # Android: `env` must not be passed (frida rejects/breaks on it),
+            # desktop: keep the historical `env={}` + `stdio="pipe"`.
+            spawn_kwargs = build_spawn_kwargs(argv, is_android)
+            logging.debug(f'spawn kwargs: {spawn_kwargs}')
+            process = int(dev.spawn(process, **spawn_kwargs))
             logging.info("Spawning process ")
         sess = dev.attach(process)
 
         # TODO: refactor + cleanup...
         epoch = str(int(time.time()))
-        slide = None # ASLR slide
-        seen_tids = set() # seen thread IDs
-        midline_break = {}
+        writer = FrinetTraceWriter(warn=logging.warning)
+        seen_tids = set() # seen thread IDs (kept for logging)
+        msg_count = [0]   # number of trace messages handled (used to drain frida)
         logging.info('Loading JS module...')
+
+        def trace_path(tid):
+            return f'{TRACES_DIR}/' + trace_filename(procname, epoch, tid)
+
+        def flush_writer():
+            """Write whatever partial record is still buffered."""
+            if writer is None:
+                return
+            for tid, text in writer.flush().items():
+                if text:
+                    file_append(trace_path(tid), text)
+
         script = sess.create_script(file_read(MODULE_JS_PATH))
         def on_message(msg, data):
-            global slide
             logging.debug(f'message: {msg}')
 
             if msg['type'] == 'error':
@@ -125,32 +157,38 @@ def do_trace(args, attach):
                 if isinstance(payload, list): #Slow mode
                     payload = do_slowmode_output(payload, arch)
 
-                if payload['id'] == 'slide':
-                    slide = int(payload['slide'], 0)
-                    logging.info(f'Received ASLR slide: 0x{slide:x}.')
+                if not isinstance(payload, dict):
                     return
-                elif payload['id'] == 'trace':
-                    tid = payload['tid']
-                    data = payload['data']
-                    if not data:
-                        return
-                    if tid in midline_break and midline_break[tid]: #Not very nice but works
-                        newline_idx = data.find("\n")
-                        data = data[:newline_idx]+re.sub("^,","",data[newline_idx:],flags=re.M)
+
+                msg_id = payload.get('id')
+                if msg_id == 'slide':
+                    # runtime module base + size: `off=` is only emitted for
+                    # PCs inside [slide, slide + size)
+                    writer.set_slide(payload.get('slide'), payload.get('size'))
+                    if writer.slide is None:
+                        logging.warning('ASLR slide is not valid, off= fields are disabled.')
+                    elif writer.size is None:
+                        logging.warning('Module size is unknown, off= fields are disabled.')
                     else:
-                        data = re.sub("^,","",data,flags=re.M)
-                    path = f'{TRACES_DIR}/'+re.sub("[^a-zA-Z_0-9.]","",f'{procname}_{epoch}_{tid}.tenet')
-                    # TODO: refactor + cleanup...
-                    if not tid in seen_tids:
-                        logging.info(f'Received trace data for new thread {tid}.')
-                        if slide is None:
-                            logging.warning(f'ASLR slide is not known.')
-                        else:
-                            data = f'slide=0x{slide:x}\n'+data
+                        logging.info(f'Received ASLR slide: 0x{writer.slide:x} (module size 0x{writer.size:x}).')
+                    return
+                elif msg_id == 'trace':
+                    tid = payload.get('tid')
+                    if tid is None:
+                        return
+                    chunk = payload.get('data')
+                    if not chunk:
+                        return
+                    msg_count[0] += 1
+                    if tid not in seen_tids:
                         seen_tids.add(tid)
-                    midline_break[tid] = data[-1]!="\n"
-                    logging.info(f'Writing trace data of {len(data)} bytes...')
-                    file_append(path, data)
+                        logging.info(f'Received trace data for new thread {tid}.')
+                    # FRINET conversion: complete records only, `off=` prepended,
+                    # `slide=` header emitted once per per-thread file.
+                    text = writer.convert(tid, chunk)
+                    if text:
+                        logging.debug(f'Writing trace data of {len(text)} bytes...')
+                        file_append(trace_path(tid), text)
                     return
         script.on('message', on_message)
         script.load()
@@ -163,6 +201,8 @@ def do_trace(args, attach):
         elif arch!="arm64" and arch!='x64' and not args.slow:
             logging.warning(f'Process architecture {arch} is only supported in slow mode.\n Slow mode has been acivated.')
             args.slow = True
+
+        writer.set_arch(arch)
         
         if args.slow and not args.exclude:
             logging.warning("The exclude option was activated because it is required for slow mode")
@@ -217,6 +257,10 @@ def do_trace(args, attach):
 
         print("")
         script.exports_sync.end()
+        # frida delivers the final flush messages asynchronously: give them a
+        # moment to arrive so no record is cut short.
+        wait_for_quiet(lambda: msg_count[0], quiet=0.2, timeout=3.0)
+        flush_writer()
         script.unload()
         sess.detach()
     except frida.ServerNotRunningError as exc:
@@ -234,6 +278,12 @@ def do_trace(args, attach):
     except frida.InvalidOperationError as exc:
         logging.critical(f'Aw, Snap! Something went wrong: `{exc}`.')
         return 1
+    finally:
+        # never lose the tail of a thread file (Ctrl+C, crash, early return)
+        try:
+            flush_writer()
+        except Exception as exc:
+            logging.debug(f'Could not flush the trace buffer: {exc}')
 
     return 0
 

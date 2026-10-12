@@ -42,7 +42,7 @@ function trace(args) {
                 return 1;
         }
 
-        send({id: "slide", slide: base});
+        send({id: "slide", slide: base, size: end.sub(base)});
         
         var flush;
         var js_transform;
