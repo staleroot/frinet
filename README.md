@@ -340,8 +340,8 @@ python3 -m pytest tests/ -q
 
 | Configuration | Result |
 |---|---|
-| No Qt binding installed | **305 passed, 8 skipped** |
-| With PySide6 installed | **306 passed, 7 skipped** |
+| No Qt binding installed | **321 passed, 8 skipped** |
+| With PySide6 installed | **322 passed, 7 skipped** |
 
 Of the skips, **one** is the Qt smoke test, which only runs when PySide6 is
 available. The other **seven** are end-to-end tests built on `example.tenet`,
@@ -374,6 +374,27 @@ is also covered individually by tests that build their own traces.
   moves the cursor, that the view's own place is *never* mutated, that a clean
   success still logs itself, and that a missing clone API falls through to
   construction instead of giving up.
+* **Scroll placement** — `jumpto`'s `y` is the *screen row* the target line
+  is drawn at, not a line number, so `y=0` pins the cursor to the first
+  visible line (and, once the scroll clamps at the end of a function, to the
+  last). The row is aimed at the middle of the pane, measured from the Qt
+  bridge since no IDA API reports a viewer's height in lines. Tests assert
+  the row is never past the visible height, that an unmeasurable widget still
+  lands off row 0 with the guess labelled as a guess, and — the part that
+  matters — that a viewer which refuses or raises on a non-zero `y` still
+  falls back to the proven `y=0` rather than losing the cursor move.
+* **Correcting a jump that was already on screen** — IDA only honours `y`
+  when the line is off screen; the already-visible path moves the cursor and
+  leaves the scroll alone (its own `CVNF_LAZY` wording: *"This might
+  disregard the Y position in case of success"*). So the row is **read back**
+  after every jump and reported as `[row …]`, and when it is not the middle a
+  prime jump is issued whose `y` is solved so that the scroll it produces *is*
+  the final one — the pane moves once, straight to its final position, and
+  the return jump only carries the cursor. Tests drive a fake that models
+  that asymmetry and assert both directions of the correction, that a
+  nonsense read-back causes no prime at all, that a refused prime leaves the
+  cursor on the target rather than stranded, and that a picky return still
+  falls back to column zero.
 * **Place-class discovery** — `place_t_as_*` downcast helpers are recognised
   as helpers rather than offered as places (they return `None` instead of
   raising, so a `None` would otherwise reach `jumpto` and report success while
@@ -456,7 +477,7 @@ then no UI appears.
 ```
 pip install PySide6
 python3 -m pytest tests/test_frinet_qt_smoke.py -q     # 1 passed
-python3 -m pytest tests/ -q                            # 306 passed, 7 skipped
+python3 -m pytest tests/ -q                            # 322 passed, 7 skipped
 ```
 
 Point it at an existing copy instead of installing:
@@ -514,7 +535,7 @@ IDA after setting it — the plugin reads it once at import.
 | `sync: queued flush for idx=…` → `sync: flush idx=…` | **The pair to check when "nothing happened".** Both appear → the sync ran and the `SyncEvent` that follows says what it decided. Only *queued* appears → the position change reached the sync but its timer never fired. Neither → the change never reached the sync layer at all, so the problem is upstream of it. |
 | `sync SyncEvent(idx=…, ea=…, applied=…, reason=…)` | Every pseudocode sync attempt, with why it did or did not apply. **`applied=False` next to an empty `reason` and `precision='expr'` means every stage resolved and only the cursor move was refused** — check that against the `pseudocode jump …` line below. `no-ctree-item` means a view is showing the function but nothing in it maps to that address. |
 | `pseudocode: … -> target=… open=[…]` | A view had to be obtained, and how. `target=` is the function the trace is in, `open=[…]` every pseudocode view we can see. **This line separates "nothing was open" from "it was open on a different function"**, which from `SyncEvent` alone are indistinguishable and need different fixes. |
-| `pseudocode jump to line … (x=…) via …` / `… failed: …` | The cursor move itself. `via … line_place(clone)` is the route that works on IDA 9.4: every `*place_t` class there is abstract, so a place cannot be *constructed* — the view's own place is cloned and the clone retargeted (`n` is the line field). A refused `jumpto` *returns* `False` rather than raising, so without this line a sync that maps perfectly is indistinguishable from one that never ran — and a **clean success logs too**, because silence and failure otherwise look identical. On failure the line carries the attempt list: which getter, which downcast, which place class, and every refusal or exception in order. |
+| `pseudocode jump to line … (x=…) via …` / `… failed: …` | The cursor move itself. `via … line_place(clone)` is the route that works on IDA 9.4: every `*place_t` class there is abstract, so a place cannot be *constructed* — the view's own place is cloned and the clone retargeted (`n` is the line field). A refused `jumpto` *returns* `False` rather than raising, so without this line a sync that maps perfectly is indistinguishable from one that never ran — and a **clean success logs too**, because silence and failure otherwise look identical. On failure the line carries the attempt list: which getter, which downcast, which place class, and every refusal or exception in order. The `y=…` in `via …` is the screen row the line was aimed at (`y=0` means a non-zero row was refused or raised and the proven fallback was used; `y=12` with `viewport height unmeasured` means the pane height could not be measured). The trailing `[row …]` is the row it **actually** landed on, read back from the view: `[row 12]` is centred already, `[row 5 -> 12, prime 88 y=0]` was corrected from row 5 by a prime jump, and `after: … read-back row N is outside …` means the value was not a row at all so **no correction was attempted** (the jump still succeeded). |
 | `pseudocode nav surface: …` | A one-shot block printed after a failed jump where nothing could be built: every `*place_t` the build exposes, which navigation APIs are present, and the full member list of `ida_hexrays.vdui_t`. Printed once per trace, never once per event. |
 
 When reporting a problem, the whole output window from a `TENET_DEBUG=1`

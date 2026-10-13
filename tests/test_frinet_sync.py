@@ -1701,6 +1701,436 @@ def test_repeated_identical_attempts_are_recorded_once(hexrays_mod):
     assert attempts == ["jumpto(ct, good_line_place_t) refused"]
 
 
+#-------------------------------------------------------------------------
+# Scroll position: landing on the right line at the edge of the viewport
+# shows the wrong half of the function
+#-------------------------------------------------------------------------
+#
+# ida_kernwin.jumpto(view, place, x, y) takes y as the row *on screen* at
+# which the target line is drawn -- the viewer scrolls to
+# scroll_top = line - y and clamps that against the document. y=0 therefore
+# parks the cursor on the first visible line (nothing above it) and, once
+# the scroll clamps at the end of the document, parks it on the last one
+# (nothing below it either). That was the reported symptom; it is a scroll
+# question, not a navigation one.
+#
+
+def make_recording_kernwin(accept=lambda y: True, raising=lambda y: False):
+    """
+    A stand-in for ``ida_kernwin`` that records every ``(x, y)`` it is given.
+
+    ``accept`` decides whether a jump lands; ``raising`` decides whether it
+    raises first, which is how a build that misreads ``y`` reports itself.
+    """
+    class Kernwin(object):
+        pass
+
+    kernwin = Kernwin()
+    kernwin.simpleline_place_t = AbstractPlace
+    kernwin.good_line_place_t = _place_class("good_line_place_t")
+    kernwin.jumps = []
+
+    def jumpto(handle, place, x=0, y=0):
+        if raising(y):
+            raise TypeError("Wrong number or type of arguments")
+        kernwin.jumps.append((x, y))
+        return accept(y)
+
+    kernwin.jumpto = jumpto
+    return kernwin
+
+
+def _one_target(kernwin):
+    place = kernwin.good_line_place_t()
+    return [("good_line_place_t", place, "ct", object())]
+
+
+def test_the_target_line_is_scrolled_to_the_middle(hexrays_mod, monkeypatch):
+    #
+    # The whole request: a line at row 0 of a 41-line pane shows nothing
+    # above it, and one at row 40 shows nothing below. Row 20 shows both.
+    #
+    kernwin = make_recording_kernwin()
+    monkeypatch.setattr(hexrays_mod, "_viewport_rows", lambda handle: 41)
+
+    result = hexrays_mod._try_jump(kernwin, _one_target(kernwin), 0, [])
+
+    assert kernwin.jumps == [(0, 20)]
+    assert "y=20" in result, "the row that landed is not in the log line"
+
+
+def test_the_clone_route_also_centres_the_cursor(hexrays_mod, monkeypatch):
+    #
+    # The path every real sync event takes. Without this the centre would be
+    # tested on a helper the controller never calls.
+    #
+    import sys
+
+    kernwin = make_clone_kernwin()
+    monkeypatch.setitem(sys.modules, "ida_kernwin", kernwin)
+    monkeypatch.setattr(hexrays_mod, "_viewport_rows", lambda handle: 41)
+
+    assert hexrays_mod.jump_to_item(make_vdui(), 15, x=57) is True
+
+    _handle, line, x, y = kernwin.jumps[0]
+    assert (line, x, y) == (15, 57, 20)
+
+
+def test_a_refused_centred_row_falls_back_to_the_proven_one(hexrays_mod,
+                                                             monkeypatch):
+    #
+    # y=0 is the only value here verified against a real build. Centring is
+    # an improvement, never a prerequisite: a viewer that refuses a
+    # non-zero y must still end up exactly where it did before.
+    #
+    kernwin = make_recording_kernwin(accept=lambda y: y == 0)
+    monkeypatch.setattr(hexrays_mod, "_viewport_rows", lambda handle: 41)
+
+    result = hexrays_mod._try_jump(kernwin, _one_target(kernwin), 0, [])
+
+    assert kernwin.jumps == [(0, 20), (0, 0)]
+    assert "y=0" in result
+
+
+def test_a_row_the_build_raises_on_does_not_stop_the_jump(hexrays_mod,
+                                                           monkeypatch):
+    #
+    # A refusal and an exception are different diagnoses, but neither may
+    # cost the user their cursor: the y=0 plan still gets its turn.
+    #
+    kernwin = make_recording_kernwin(raising=lambda y: y != 0)
+    attempts = []
+    monkeypatch.setattr(hexrays_mod, "_viewport_rows", lambda handle: 41)
+
+    result = hexrays_mod._try_jump(kernwin, _one_target(kernwin), 0, attempts)
+
+    assert kernwin.jumps == [(0, 0)]
+    assert result is not None
+    assert any("TypeError" in m for m in attempts)
+
+
+def test_an_unmeasurable_widget_still_places_the_line_off_the_top(
+        hexrays_mod, monkeypatch):
+    #
+    # No Qt bridge (head-less host, or a widget it will not convert): the
+    # height is unknown, but "somewhere below row 0" still shows context
+    # above the cursor for any pane taller than the guess -- and the guess
+    # is labelled as a guess rather than presented as a measurement.
+    #
+    kernwin = make_recording_kernwin()
+    attempts = []
+    monkeypatch.setattr(hexrays_mod, "_viewport_rows", lambda handle: None)
+
+    hexrays_mod._try_jump(kernwin, _one_target(kernwin), 0, attempts)
+
+    assert hexrays_mod.FALLBACK_ROW > 0
+    assert kernwin.jumps[0] == (0, hexrays_mod.FALLBACK_ROW)
+    assert any("unmeasured" in m for m in attempts)
+
+
+def test_no_row_is_ever_requested_beyond_the_visible_height(hexrays_mod,
+                                                            monkeypatch):
+    #
+    # The other half of the original symptom: asking for a row the pane does
+    # not have is what clamped the scroll to the bottom. A one-line pane has
+    # no middle to speak of, so it asks for the only row it has.
+    #
+    for rows, want in ((1, 0), (2, 1), (41, 20)):
+        kernwin = make_recording_kernwin()
+        monkeypatch.setattr(hexrays_mod, "_viewport_rows",
+                            lambda handle, n=rows: n)
+
+        hexrays_mod._try_jump(kernwin, _one_target(kernwin), 0, [])
+
+        assert kernwin.jumps[0][1] == want, "for a %d-row pane" % rows
+
+
+def test_viewport_rows_are_widget_pixels_over_line_pitch(hexrays_mod,
+                                                         monkeypatch):
+    #
+    # Nothing in IDA reports how many lines a viewer shows, so it is derived
+    # from Qt. This is the derivation, checked against a widget with known
+    # numbers rather than against a screen.
+    #
+    from tenet.integration.api import ida_api
+
+    class Metrics(object):
+        def lineSpacing(self):
+            return 14
+
+    class QtWidget(object):
+        def height(self):
+            return 700
+
+        def fontMetrics(self):
+            return Metrics()
+
+    monkeypatch.setattr(ida_api, "twidget_to_qt", lambda handle: QtWidget())
+
+    assert hexrays_mod._viewport_rows(object()) == 50
+
+
+def test_a_font_without_line_spacing_falls_back_to_its_height(hexrays_mod,
+                                                               monkeypatch):
+    from tenet.integration.api import ida_api
+
+    class Metrics(object):
+        def height(self):
+            return 16
+
+    class QtWidget(object):
+        def height(self):
+            return 320
+
+        def fontMetrics(self):
+            return Metrics()
+
+    monkeypatch.setattr(ida_api, "twidget_to_qt", lambda handle: QtWidget())
+
+    assert hexrays_mod._viewport_rows(object()) == 20
+
+
+def test_a_widget_that_will_not_convert_yields_no_measurement(hexrays_mod,
+                                                               monkeypatch):
+    #
+    # This runs on every cursor move, inside a UI callback. The bridge
+    # raises rather than returning nothing, so the failure has to become
+    # "unknown height" and never an exception out of the sync loop.
+    #
+    from tenet.integration.api import ida_api
+
+    def refuse(handle):
+        raise RuntimeError("could not convert twidget")
+
+    monkeypatch.setattr(ida_api, "twidget_to_qt", refuse)
+
+    assert hexrays_mod._viewport_rows(object()) is None
+
+    monkeypatch.setattr(ida_api, "twidget_to_qt", lambda handle: None)
+    assert hexrays_mod._viewport_rows(object()) is None
+
+
+#-------------------------------------------------------------------------
+# Correcting a jump that landed on screen: the scroll never moves
+#-------------------------------------------------------------------------
+#
+# The two cases behaved differently for a reason. jumpto scrolls to
+# line - y *when the line is off screen*; when it is already on screen the
+# cursor moves and the scroll stays put -- IDA's own wording for the
+# equivalent flag is "try and move the cursor to a line displaying the
+# place_t if possible. This might disregard the Y position in case of
+# success." So a far jump centred and a near one did not.
+#
+
+def make_scrolling_kernwin(rows=24, total=4000, scroll_top=0, cursor_line=0):
+    """
+    A stand-in for ``ida_kernwin`` that models that asymmetry.
+
+    ``refuse`` is a predicate so a test can make a single jump fail without
+    restructuring the fixture; ``jumps`` records every ``(line, x, y)``
+    offered, refusals included, because what was *attempted* is the thing a
+    log line has to explain.
+    """
+    class Kernwin(object):
+        pass
+
+    class LinePlace(object):
+        def __init__(self, n=0):
+            self.n = n
+
+        def clone(self):
+            return LinePlace(self.n)
+
+    kernwin = Kernwin()
+    kernwin.state = {"rows": rows, "total": total,
+                     "scroll": scroll_top, "line": cursor_line}
+    kernwin.jumps = []
+    kernwin.refuse = lambda line, x, y: False
+
+    def visible(line):
+        s = kernwin.state
+        return 0 <= line - s["scroll"] < s["rows"]
+
+    def jumpto(handle, place, x=0, y=0):
+        s = kernwin.state
+        line = int(getattr(place, "n", -1))
+        kernwin.jumps.append((line, x, y))
+        if kernwin.refuse(line, x, y):
+            return False
+        if line < 0 or line >= s["total"]:
+            return False                       # outside the listing entirely
+        if not visible(line):
+            s["scroll"] = max(0, min(line - y, s["total"] - s["rows"]))
+        s["line"] = line
+        return True
+
+    kernwin.jumpto = jumpto
+    kernwin.LinePlace = LinePlace
+    kernwin.get_custom_viewer_place = (
+        lambda handle, mouse: (LinePlace(kernwin.state["line"]), 0,
+                               kernwin.state["line"]
+                               - kernwin.state["scroll"]))
+    kernwin.place_t_as_simpleline_place_t = (
+        lambda p: p if isinstance(p, LinePlace) else None)
+    kernwin.activate_widget = lambda handle, current: True
+    kernwin.cursor_line = lambda: kernwin.state["line"]
+    kernwin.cursor_row = lambda: (kernwin.state["line"]
+                                  - kernwin.state["scroll"])
+    kernwin.scroll = lambda: kernwin.state["scroll"]
+    return kernwin
+
+
+def recentre_vdui_and_log(hexrays_mod, monkeypatch, kernwin, rows):
+    """Install the fake view + fixed pane height, and capture ``pdbg``."""
+    import sys
+
+    reported = []
+    monkeypatch.setitem(sys.modules, "ida_kernwin", kernwin)
+    monkeypatch.setattr(hexrays_mod, "_viewport_rows", lambda handle: rows)
+    monkeypatch.setattr(hexrays_mod, "pdbg",
+                        lambda fmt, *args: reported.append(fmt % args))
+    return make_vdui(), reported
+
+
+def test_a_line_already_above_the_middle_is_pulled_down(hexrays_mod,
+                                                        monkeypatch):
+    #
+    # The reported symptom. Line 100 is on screen at row 5, so jumpto moves
+    # the cursor and leaves the scroll alone -- the prime makes the scroll
+    # jump straight to its final value, and the return trip only carries the
+    # cursor, so the pane moves exactly once.
+    #
+    kernwin = make_scrolling_kernwin(rows=24, scroll_top=95, cursor_line=95)
+    vdui, reported = recentre_vdui_and_log(hexrays_mod, monkeypatch,
+                                           kernwin, 24)
+
+    assert hexrays_mod.jump_to_item(vdui, 100, x=4) is True
+
+    assert kernwin.cursor_row() == 12, "not centred"
+    assert kernwin.cursor_line() == 100, "cursor stranded elsewhere"
+    assert any("row 5 -> 12" in line for line in reported)
+
+
+def test_a_line_already_below_the_middle_is_pulled_up(hexrays_mod,
+                                                      monkeypatch):
+    #
+    # The mirror image: the pane has to scroll *down*, so the prime has to
+    # sit below the viewport, and its y has to come out inside the pane or
+    # the whole thing is refused rather than guessed.
+    #
+    kernwin = make_scrolling_kernwin(rows=24, scroll_top=80, cursor_line=80)
+    vdui, reported = recentre_vdui_and_log(hexrays_mod, monkeypatch,
+                                           kernwin, 24)
+
+    assert hexrays_mod.jump_to_item(vdui, 100, x=4) is True
+
+    assert kernwin.cursor_row() == 12, "not centred"
+    assert kernwin.cursor_line() == 100
+    assert any("row 20 -> 12" in line for line in reported)
+
+
+def test_a_far_jump_that_already_centres_is_left_alone(hexrays_mod,
+                                                       monkeypatch):
+    #
+    # The case that was already working. It must not pay for a prime it did
+    # not need -- one jumpto, not three.
+    #
+    kernwin = make_scrolling_kernwin(rows=24, scroll_top=0, cursor_line=0)
+    vdui, reported = recentre_vdui_and_log(hexrays_mod, monkeypatch,
+                                           kernwin, 24)
+
+    assert hexrays_mod.jump_to_item(vdui, 100, x=4) is True
+
+    assert kernwin.jumps == [(100, 4, 12)]
+    assert kernwin.cursor_row() == 12
+    assert any("[row 12]" in line for line in reported)
+
+
+def test_a_nonsense_read_back_never_causes_a_prime(hexrays_mod, monkeypatch):
+    #
+    # Everything downstream is arithmetic on a value read back from IDA. If
+    # that value is not a row at all, the answer is to do nothing and say
+    # so -- not to jump somewhere computed from it.
+    #
+    kernwin = make_scrolling_kernwin(rows=24, scroll_top=95, cursor_line=95)
+    vdui, reported = recentre_vdui_and_log(hexrays_mod, monkeypatch,
+                                           kernwin, 24)
+    kernwin.get_custom_viewer_place = (
+        lambda handle, mouse: (kernwin.LinePlace(100), 0, 999))
+
+    assert hexrays_mod.jump_to_item(vdui, 100, x=4) is True
+
+    assert kernwin.cursor_line() == 100
+    assert kernwin.scroll() == 95, "a nonsense row moved the pane"
+    assert any("outside the 24 visible" in line for line in reported)
+
+
+def test_a_refused_prime_leaves_the_cursor_on_the_target(hexrays_mod,
+                                                         monkeypatch):
+    #
+    # The prime is the only move that takes the cursor off line 100. If it
+    # fails halfway, the cursor must still end up on 100 -- a scroll fix may
+    # not be able to break navigation, which is the thing that already works.
+    #
+    kernwin = make_scrolling_kernwin(rows=24, scroll_top=95, cursor_line=95)
+    kernwin.refuse = lambda line, x, y: line == 88
+    vdui, reported = recentre_vdui_and_log(hexrays_mod, monkeypatch,
+                                           kernwin, 24)
+
+    assert hexrays_mod.jump_to_item(vdui, 100, x=4) is True
+
+    assert kernwin.cursor_line() == 100, "cursor left on the prime line"
+    assert kernwin.scroll() == 95, "a refused prime still moved the pane"
+    assert any("refused" in line for line in reported)
+
+
+def test_a_picky_return_still_carries_the_cursor_back(hexrays_mod,
+                                                      monkeypatch):
+    #
+    # After the prime the return jump is the only thing that can put the
+    # cursor right, and it runs through the same column fallbacks as any
+    # other jump -- so a view that refuses the requested column still ends
+    # on the target line.
+    #
+    kernwin = make_scrolling_kernwin(rows=24, scroll_top=95, cursor_line=95)
+    kernwin.refuse = lambda line, x, y: x == 4
+    vdui, reported = recentre_vdui_and_log(hexrays_mod, monkeypatch,
+                                           kernwin, 24)
+
+    assert hexrays_mod.jump_to_item(vdui, 100, x=4) is True
+
+    assert kernwin.cursor_line() == 100
+    assert kernwin.cursor_row() == 12
+
+
+def test_a_failed_return_is_reported_rather_than_swallowed(hexrays_mod,
+                                                            monkeypatch):
+    #
+    # The prime is the only move that takes the cursor off the target line.
+    # The return carries its own fallbacks, so it should not be possible to
+    # strand it -- but if a build ever does, silence would look exactly like
+    # "it worked", and a scroll fix must not be able to break the navigation
+    # that already works without saying so.
+    #
+    primed = {"on": False}
+
+    def refuse(line, x, y):
+        if line == 88:
+            primed["on"] = True
+        return line == 100 and primed["on"]
+
+    kernwin = make_scrolling_kernwin(rows=24, scroll_top=95, cursor_line=95)
+    kernwin.refuse = refuse
+    vdui, reported = recentre_vdui_and_log(hexrays_mod, monkeypatch,
+                                           kernwin, 24)
+
+    assert hexrays_mod.jump_to_item(vdui, 100, x=4) is True
+
+    assert kernwin.cursor_line() == 88, "expected the prime to be the last move"
+    assert any("NO RETURN" in line for line in reported)
+    assert any("stranded" in line for line in reported)
+
+
 def test_a_failed_place_reports_why(hexrays_mod):
     #
     # "nothing could be constructed" is useless on its own -- the entire

@@ -255,7 +255,7 @@ Run with `TENET_DEBUG=1` and watch for `pseudocode: … -> target=… open=[…]
       `applied=False` with an empty `reason` means everything resolved —
       address, function, ctree item — and only the cursor move was refused.
       On a working setup the companion line reads
-      `pseudocode jump to line … via jumpto(ct, line_place(clone), x=…)` —
+      `pseudocode jump to line … via jumpto(ct, line_place(clone), x=…, y=…)` —
       that is the route IDA 9.4 allows (see §10), and a *clean* success
       prints it too, so an absence of any `pseudocode jump …` line is itself
       a failure. When it does fail, the line carries the attempt list: which
@@ -265,6 +265,48 @@ Run with `TENET_DEBUG=1` and watch for `pseudocode: … -> target=… open=[…]
       block follows it, listing every place class this build exposes and the
       members of `ida_hexrays.vdui_t`. Paste that too — it *is* the answer,
       and `tools/probe_hexrays_place.py` (§10) becomes unnecessary.
+- [ ] **The landed line is centred, not pinned to an edge.** After a jump the
+      target statement sits roughly halfway down the pane, with readable code
+      **both above and below it**. It must not be on the first visible line
+      (nothing above) nor the last (nothing below) — the latter happens once
+      the scroll clamps against the end of a function.
+      Every `pseudocode jump …` line ends with `[row …]`, which is the row
+      the line **actually** landed on, read back from the view rather than
+      assumed from what was requested — so it is the whole diagnosis:
+
+      * `[row 12]` — landed on the middle already; nothing to correct. This
+        is the normal far-jump case and the pane moved once.
+      * `[row 5 -> 12, prime 88 y=0]` — it was on screen at row 5 and was
+        pulled to the middle. The `prime` is the line used to force the
+        scroll (§10); the pane moved exactly once, straight to its final
+        position, and the cursor came back to the target.
+      * `wanted N` appended — the correction ran and could not reach the
+        middle, which happens at the very start and very end of a listing
+        where there is nothing to scroll to. Report it: it should only
+        appear within a few lines of line 0 or of the last line.
+      * `[row 0]` or any row that is not close to half your pane height —
+        the read-back disagrees with what you see. That is the one to
+        report, since it means `y` does not mean screen row on this build.
+      * `after: … read-back row N is outside the … visible lines` — the
+        value was not a row at all, so **no correction was attempted**. The
+        jump itself still succeeded; report it, as it points at
+        `get_custom_viewer_place` rather than at scrolling.
+
+      The `y=…` earlier in the line is the row that was *aimed* for, and is
+      still worth checking: `y=0` means a non-zero row was refused or raised
+      and the proven fallback was used (§10) — correct, but report it, since
+      it means this build reads `y` differently. `y=12` with
+      `viewport height unmeasured` in the attempt list means the pane height
+      could not be measured and the labelled guess was used, which points at
+      the Qt bridge rather than at the jump.
+- [ ] **A line that is already on screen still gets centred.** This is the
+      case that behaves differently from a long jump, so test it
+      deliberately: step to an index, then step to a *nearby* one (e.g. 32
+      then 31) whose line is comfortably inside the pane. The view must
+      scroll so that line moves to the middle — not merely move the cursor
+      to it. `jumpto` only scrolls when the line is off screen and can
+      "disregard the Y position" otherwise (§10), so a missing
+      `prime …` in the log on this test is the bug, not the norm.
 - [ ] **It keeps working, not just the first time.** From a *different*
       position, go back to the same index (e.g. 14) at least three times in
       a row, and try at least three different indexes — each time the view
@@ -478,7 +520,7 @@ When filing an issue found via this plan, include:
 ### Pseudocode cursor specifically
 
 FRINET positions the pseudocode cursor with
-`ida_kernwin.jumpto(vdui.ct, place, x, 0)`, which needs a `place_t`.
+`ida_kernwin.jumpto(vdui.ct, place, x, y)`, which needs a `place_t`.
 
 **A place cannot be constructed on IDA 9.4 — but it can be cloned.** Every
 `*place_t` class this build exposes (`idaplace_t`, `place_t`,
@@ -492,7 +534,7 @@ and the idavim plugin use:
 place, cur_x, cur_y = ida_kernwin.get_custom_viewer_place(vdui.ct, False)
 target = ida_kernwin.place_t_as_simpleline_place_t(place.clone())
 target.n = line          # `n` is the line field, not `at`
-ida_kernwin.jumpto(vdui.ct, target, x, 0)
+ida_kernwin.jumpto(vdui.ct, target, x, y)
 ```
 
 The clone is mandatory — `place` is shared view state, and mutating it in
@@ -503,6 +545,51 @@ a place, remembering whichever class the viewer takes. Because a failed
 construction produces the identical refusal on every trace event, that
 answer is cached after the first failure instead of being re-printed until
 the trace ends.
+
+**`y` is a screen row, not a line number.** The viewer scrolls to
+`scroll_top = target_line - y` and clamps that against the document, so
+`y=0` parks the cursor on the *first visible line* — no context above it —
+and parks it on the *last* one near the end of a function, where the scroll
+clamps — no context below it either. (That IDA takes `y` and `lnnum`
+separately in `ea_viewer_history_push_and_jump(v, ea, x, y, lnnum)` is what
+shows `y` is not a line number; IDA's own example calls `self.Jump(v, 0, 5)`.)
+
+FRINET therefore aims for the middle of the pane. No IDA API reports a
+viewer's height in lines, so it is measured through the Qt bridge — widget
+pixels over the font's line pitch — and halved. The row actually used is in
+every `pseudocode jump …` log line as `y=…`, so §5.1 can tell the three
+outcomes apart without a debugger: a centred row, `y=0` because this build
+refused or raised on a non-zero one (the fallback keeps the cursor moving,
+which is why it exists), or `y=12` because the height could not be measured
+at all. The fallback is deliberate — centre is an improvement, never a
+prerequisite.
+
+**But `y` is only honoured when the line is off screen.** The
+already-visible path moves the cursor and leaves the scroll where it is.
+IDA says as much about the equivalent flag, `CVNF_LAZY`: *"try and move the
+cursor to a line displaying the place_t if possible. This might disregard
+the Y position in case of success."* So a long jump centred and a short one
+did not — same call, same `y`, different answer.
+
+The correction is a **prime**: after the jump, the row is read back from
+`get_custom_viewer_place` (the same `(place, x, y)` triple the clone route
+already uses), and if it is not the middle, a *second* jump is made to a
+line just outside the viewport whose `y` is chosen so that
+
+```
+prime_line - prime_y  ==  line - desired_row
+```
+
+— that is, the scroll it produces **is** the final scroll. The pane then
+moves once, straight to where it should end up, and a return jump to the
+target only carries the cursor, because at that point the target is
+visible at the middle and needs no scroll. Both primes are chosen to be
+provably off screen (`line - desired` above the pane, `line + (rows - row)`
+below it) and the computed `y` is range-checked before use, so a prime built
+from a misread value can only do nothing, never something wrong. The
+read-back row is in the log as `[row A -> B, prime P y=Y]`, and if the
+prime is refused the cursor is left on the target line — a scroll fix must
+not be able to break the navigation that already works.
 
 Three IDA API guesses in a row were wrong on this build, so the plugin does
 not guess silently. On a jump where nothing could be built it prints a
